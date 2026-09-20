@@ -63,7 +63,7 @@ async function refreshModels() {
       headers: { "User-Agent": "Mozilla/5.0 (cline2api)" },
     });
     if (!resp.ok) {
-      console.log("[models] 官方拉取失败 HTTP", resp.status, "回退内置列表");
+      console.log("[models] upstream fetch failed, HTTP", resp.status, "falling back to built-in list");
       return MODELS;
     }
     const data = await resp.json();
@@ -106,10 +106,10 @@ async function refreshModels() {
     }
     modelsCache = baseList;
     modelsCacheTime = now;
-    console.log("[models] 动态拉取成功:", modelsCache.length, "个模型 (含 cline-free 免费通道)");
+    console.log("[models] dynamic fetch OK:", modelsCache.length, "models (incl. cline-free channel)");
     return modelsCache;
   } catch (e) {
-    console.log("[models] 拉取异常:", String(e).slice(0, 100), "回退内置列表");
+    console.log("[models] fetch error:", String(e).slice(0, 100), "falling back to built-in list");
     return MODELS;
   }
 }
@@ -254,12 +254,16 @@ async function getAccountToken(account) {
   });
   if (!resp.ok) {
     // 刷新失败：冷却 60s，交给上层切号
+    let bodySnippet = "";
+    try { bodySnippet = (await resp.clone().text()).slice(0, 200); } catch (e) {}
+    console.log(`[refresh] failed status=${resp.status} body=${bodySnippet} tokenLen=${account.refreshToken?.length || 0}`);
     account.cooldownUntil = now + 60 * 1000;
     throw new Error("refresh_failed");
   }
   const data = await resp.json();
   const accessToken = data?.data?.accessToken;
   if (!accessToken) {
+    console.log(`[refresh] no_token keys=${Object.keys(data || {}).join(",")}|dataKeys=${Object.keys(data?.data || {}).join(",")}`);
     account.cooldownUntil = now + 60 * 1000;
     throw new Error("refresh_no_token");
   }
@@ -316,7 +320,7 @@ function candidateOrder(n, strategy) {
 async function getAccessToken(env) {
   const pool = parseAccounts(env);
   if (pool.length === 0) {
-    throw new Error("缺少 CLINE_REFRESH_TOKEN 环境变量");
+    throw new Error("missing CLINE_REFRESH_TOKEN env var");
   }
   // 按策略顺序尝试账号（跳过冷却中的；刷新失败自动切下一个）
   const order = candidateOrder(pool.length, parseStrategy(env));
@@ -337,7 +341,7 @@ async function getAccessToken(env) {
   try {
     return await getAccountToken(acc);
   } catch (e) {
-    throw new Error("所有账号刷新 token 均失败");
+    throw new Error("all accounts failed to refresh token");
   }
 }
 
@@ -513,13 +517,13 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
         currentAccount.cooldownUntil = Date.now() + cooldownMs;
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
-        console.log(`[account-switch] 账号额度/限流，冷却 ${Math.round(cooldownMs / 1000)}s，切换到下一个`);
+        console.log(`[account-switch] quota/rate limit hit, cooling down ${Math.round(cooldownMs / 1000)}s, switching to next account`);
       }
       // 还有可用账号 → 短退避后重试（会切到下一个号）
       const pool = parseAccounts(env);
       const hasOther = pool.some((a) => !a.cooldownUntil || a.cooldownUntil <= Date.now());
       if (!hasOther) {
-        console.log(`[retry] 所有账号均冷却，直接返回上游响应`);
+        console.log(`[retry] all accounts cooling down, returning upstream response as-is`);
         return resp; // 不空转，把 429/错误返回给客户端
       }
       // 丢弃该响应（流式流已被 peek 打开；非流式 clone 挂着）——显式 cancel 防资源泄漏
@@ -657,14 +661,14 @@ async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, firstRes
         currentAccount.cooldownUntil = Date.now() + 30 * 1000; // 短冷却 30s
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
-        console.log(`[empty-content] 账号 ${attempt} 返回空 content，冷却 30s，重试第 ${attempt + 2} 次`);
+        console.log(`[empty-content] account ${attempt} returned empty content, 30s cooldown, retry #${attempt + 2}`);
       }
       await sleep(300 + Math.floor(Math.random() * 300));
       resp = null; // 下次循环重新请求（切到下一个号）
       continue;
     }
     // 完全空（连 reasoning 都没有）→ 也重试
-    console.log(`[empty-response] 账号 ${attempt} 完全空响应，重试第 ${attempt + 2} 次`);
+    console.log(`[empty-response] account ${attempt} returned fully empty response, retry #${attempt + 2}`);
     await sleep(300 + Math.floor(Math.random() * 300));
     resp = null;
   }
