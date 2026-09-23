@@ -83,6 +83,7 @@ check_health() {
   url="$1/v1/health"
   echo "==> Health: $url"
   body="$(curl -fsS -A "$UA" "$url")"
+  echo "$body"
   echo "$body" | grep -q '"ok":true' || { echo "Health FAILED: $url -> $body" >&2; return 1; }
   echo "Health OK: $url"
 }
