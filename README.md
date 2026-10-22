@@ -68,6 +68,12 @@ python3 cline_oauth.py
 
 ## 二、部署到 Cloudflare Workers
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/pingmike2/cline2api-workers)
+
+> ⚠️ **关于一键部署**：上方按钮可自动完成初始创建，但 Cloudflare 的 Git 集成偶尔会有构建环境问题，
+> 且后续更新 `CLINE_REFRESH_TOKEN` 等机密变量时可能需要手动重新部署。
+> **如果一键部署遇到不稳定的情况，仍然推荐使用下方的「复制代码粘贴部署」方式**，最稳妥。
+
 > ⚠️ **推荐方式：复制代码粘贴部署，不要用 Git 关联仓库部署。**
 > 实测 GitHub 关联 CF 部署（Git 集成）容易因入口文件/构建环境问题导致部署失败，
 > 且改环境变量后不会自动生效。用下方「复制代码」方式最稳、最快。
@@ -95,7 +101,7 @@ python3 cline_oauth.py
 > ```bash
 > curl https://cline2api.<你的子域>.workers.dev/v1/health
 > ```
-> 返回 `api_key_configured: true` 即表示变量已生效，`account_count` 显示已配置的账号数量。
+> 返回 `authenticated: true` 即表示变量已生效，`accounts` 显示已配置的账号数量，`strategy` 显示当前账号调度策略。
 
 ### 需要的东西&环境变量说明
 
@@ -103,6 +109,7 @@ python3 cline_oauth.py
 |---|---|---|---|
 | `CLINE_REFRESH_TOKEN` | 机密 Secret | ✅ | Cline 账号 refreshToken，**一行一个，支持多账号** |
 | `API_KEY` | 机密 Secret | 建议 | 客户端访问密钥；不设则用默认 `cline2api-default-key` |
+| `ACCOUNT_STRATEGY` | 明文 Var | ❌ | 多账号调度策略：`round-robin`（默认）/ `random` / `fill-first`，详见「多账号」章节 |
 
 > 变量名必须**完全一致**（全大写、无空格）。修改后**务必保存并重新部署**才会生效。
 
@@ -116,8 +123,21 @@ python3 cline_oauth.py
 第三个账号的refreshToken
 ```
 
+**调度策略（环境变量 `ACCOUNT_STRATEGY`，v1.1.9 新增）：**
+
+| 策略 | 行为 | 适用场景 |
+|---|---|---|
+| `round-robin`（默认） | 请求轮流使用各账号：1→2→3→1→… | 均匀分摊各账号的免费额度 |
+| `random` | 每次请求随机选号 | 多实例（isolate）并存时分布最均匀 |
+| `fill-first` | 黏住第一个健康账号，冷却/失败才切下一个 | 集中消耗第一个号，其余作备用 |
+
+> ⚠️ **v1.1.9 行为变更**：v1.1.8 及之前虽然文档宣称 round-robin，但实际一直是
+> fill-first（所有请求都落在第一个账号，仅当它冷却时才切换）。v1.1.9 起轮询真正生效并成为
+> 默认值；想保持旧行为，把 `ACCOUNT_STRATEGY` 设为 `fill-first` 即可。
+> 注：round-robin 游标是实例内存变量，Workers 冷启动/多实例下为近似均匀，要求严格均匀可用 `random`。
+
 **工作机制：**
-- 🔄 **账号池轮询**：请求轮流使用不同账号（round-robin），分散单账号压力
+- 🔄 **账号池调度**：按 `ACCOUNT_STRATEGY` 策略在账号间分摊请求（默认 round-robin 轮流用号）
 - ⚡ **额度用完/限流自动切号**：某账号触发 429（`Daily free limit reached`）或空响应，
   **解析上游冷却提示**（如 `Try again in 2h 51m`），按实际时长冷却该账号并切换到下一个，同一请求换号重试
 - 🚫 **失效自动跳过**：刷新失败的账号会被跳过，不阻塞
@@ -125,7 +145,8 @@ python3 cline_oauth.py
 - 🛡️ **全部冷却不空转**：所有账号均冷却时直接返回上游响应，不盲目重试
 - 单账号时完全兼容，原样工作
 
-**验证：** 部署后访问 `/v1/health`，返回 `account_count` 即当前账号数量。
+**验证：** 部署后访问 `/v1/health`，返回 `accounts`（账号数量）与 `strategy`（当前调度策略）；
+发若干次请求后到 Cline 官方后台查看 usage，应分布在多个账号上。
 
 ### 验证部署
 
@@ -212,7 +233,7 @@ vercel --prod
 curl https://<项目名>.vercel.app/v1/health
 ```
 
-返回 `{"ok":true,"version":"1.1.8","model":"cline-free/deepseek-v4.1-flash",...}` 即成功。
+返回 `{"ok":true,"version":"1.1.9","model":"cline-free/deepseek-v4.1-flash",...}` 即成功。
 
 ```bash
 # 聊天测试
@@ -288,10 +309,24 @@ User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 ```text
 Base URL: https://cline2api.<你的子域>.workers.dev/v1   （或 https://<项目名>.vercel.app/v1）
 API Key:  <你设置的 API_KEY>
-Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
+Model:    cline-free/nemotron-3.5-super-vl   （默认，免费）
 ```
 
 兼容 OpenAI 客户端（`/v1/chat/completions`）和 Anthropic 客户端（`/v1/messages`，自动转换）。
+
+### Claude Code CLI ✅ (v1.3.0)
+
+完整支持 Claude Code（含工具调用：Write/Bash/Read 等多轮 agent 任务），配置：
+
+```bash
+export ANTHROPIC_BASE_URL="https://cline2api.<你的子域>.workers.dev"
+export ANTHROPIC_AUTH_TOKEN="<你设置的 API_KEY>"   # Claude Code 用这个头
+export ANTHROPIC_API_KEY="$ANTHROPIC_AUTH_TOKEN"
+# 模型用 GET /v1/models 里任一 cline-free/* 免费模型
+claude -p "your task" --model cline-free/nemotron-3.5-super-vl
+```
+
+提示：「doesn't recognize the model, assuming 200k context」是正常警告（模型名非 Anthropic 官方，CC 按 200k 窗口处理），可忽略。
 
 ### 可用模型（实测）
 

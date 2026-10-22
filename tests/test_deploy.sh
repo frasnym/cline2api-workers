@@ -57,14 +57,15 @@ echo "vercel $*" >> "$TEST_CALL_LOG"
 if [ "${1:-}" = "env" ] && [ "${2:-}" = "add" ]; then cat > /dev/null; fi
 exit 0
 EOF
-  # stub: curl — log URL, return canned ok JSON for health and chat
+  # stub: curl — log URL, return canned ok JSON for health, models and chat
   cat > "$STUB/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >> "$TEST_CALL_LOG"
 for a in "$@"; do
   case "$a" in
     */v1/chat/completions) echo '{"choices":[{"message":{"content":"OK"}}]}'; exit 0;;
-    */v1/health) echo '{"ok":true,"accounts":2}'; exit 0;;
+    */v1/models) echo '{"data":[{"id":"cline-free/nemotron-3.5-super-vl"},{"id":"cline-free/mimo-v2.6-flash"}]}'; exit 0;;
+    */v1/health) echo '{"ok":true,"accounts":2,"model":"cline-free/nemotron-3.5-super-vl"}'; exit 0;;
   esac
 done
 echo '{}'
@@ -92,7 +93,33 @@ EOF
   else
     ok "tokens never leak into output/log"
   fi
-  rm -rf "$STUB" "$LOG" "$OUT" "$ROOT/.tmp-test-tokens.txt" /tmp/deploy-help.txt /tmp/deploy-missing.txt
+
+  # 5. chat test must not hardcode a delisted model id — it resolves from /v1/models
+  if grep -q "cline-free/nemotron-3.5-super-vl" "$LOG" 2>/dev/null; then
+    ok "chat test resolves model from /v1/models"
+  else
+    bad "chat test resolves model from /v1/models"
+  fi
+
+  # 6. --model overrides the resolved model
+  rm -f "$LOG"; touch "$LOG"
+  OUT2="$ROOT/.tmp-test-out2.txt"
+  if TEST_CALL_LOG="$LOG" PATH="$STUB:$PATH" "$SCRIPT" \
+      --tokens-file "$ROOT/.tmp-test-tokens.txt" \
+      --cf-url https://cf.example \
+      --vercel-url https://vc.example \
+      --api-key test-key-123 \
+      --model "cline-free/explicit-model" >"$OUT2" 2>&1; then
+    if grep -q "cline-free/explicit-model" "$LOG" 2>/dev/null; then
+      ok "--model overrides resolved model"
+    else
+      bad "--model overrides resolved model"
+    fi
+  else
+    bad "--model run exits 0"
+  fi
+
+  rm -rf "$STUB" "$LOG" "$OUT" "$OUT2" "$ROOT/.tmp-test-tokens.txt" /tmp/deploy-help.txt /tmp/deploy-missing.txt
 fi
 
 echo "---"

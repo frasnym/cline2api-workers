@@ -9,8 +9,9 @@
  *  3. SSE 流式响应剥掉上游 {data:{...}} 包装，透传给客户端
  *
  * 环境变量：
- *  - CLINE_REFRESH_TOKEN (必需)  Cline 账号的 refreshToken
+ *  - CLINE_REFRESH_TOKEN (必需)  Cline 账号的 refreshToken（多行 = 多账号）
  *  - API_KEY                (可选) 自定义访问 key；不设置则每次部署随机生成并打印到日志
+ *  - ACCOUNT_STRATEGY       (可选) 多账号调度: round-robin(默认) / random / fill-first
  *
  * 用法（OpenAI 兼容）：
  *   curl https://你的worker/v1/chat/completions \
@@ -23,7 +24,8 @@ const CLINE_API_BASE = "https://api.cline.bot/api/v1";
 
 // 账号池：支持多个 Cline 账号，每个账号独立缓存 accessToken
 // CLINE_REFRESH_TOKEN 环境变量可包含多行，每行一个 refreshToken，
-// 额度用尽(空响应)时自动轮换下一个账号。
+// 调度策略由 ACCOUNT_STRATEGY 控制（默认 round-robin 轮流用号），
+// 额度用尽(空响应)/限流时自动冷却当前账号并切换到下一个。
 // 结构：{ refreshToken, accessToken, expiry, cooldownUntil }
 let accounts = [];
 let accountIndex = 0;          // round-robin 游标
@@ -32,7 +34,10 @@ let currentAccount = null;     // 当前正在使用的账号（串行队列下�
 // 模型列表：原样使用 Cline /v1/models 返回的完整模型 ID。
 // 不人为添加 cline/ 前缀；Telegram 会完整显示这些 ID，避免不同供应商模型名被截断后混淆。
 const MODELS = [
-  { id: "cline-free/deepseek-v4.1-flash", upstream: "cline-free/deepseek-v4.1-flash", provider: "cline", cost: "free" },
+  { id: "cline-free/nemotron-3.5-super-vl", upstream: "cline-free/nemotron-3.5-super-vl", provider: "cline", cost: "free" },
+  { id: "cline-free/mimo-v2.6-flash", upstream: "cline-free/mimo-v2.6-flash", provider: "cline", cost: "free" },
+  { id: "cline-free/muse-spark-1.3-contributor", upstream: "cline-free/muse-spark-1.3-contributor", provider: "cline", cost: "free" },
+  { id: "cline-free/solar-mini4", upstream: "cline-free/solar-mini4", provider: "cline", cost: "free" },
   { id: "deepseek/deepseek-v4-flash", upstream: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: "free" },
   { id: "poolside/laguna-s-2.1:free", upstream: "poolside/laguna-s-2.1:free", provider: "poolside", cost: "free" },
   { id: "cline-pass/glm-5.2", upstream: "cline-pass/glm-5.2", provider: "zai", cost: "pass" },
@@ -74,9 +79,11 @@ async function refreshModels() {
       "xiaomi/mimo-v2.5",
       "minimax/minimax-m3",
       "poolside/laguna-s-2.1",
-      "cline-free/deepseek-v4.1-flash",
+      "cline-free/nemotron-3.5-super-vl",
+      "cline-free/mimo-v2.6-flash",
       "cline-free/muse-spark-1.3-contributor",
-      "cline-free/solar-pro4",
+      "cline-free/solar-mini4",
+      "cline-free/minimax-m3.1-flash",
     ];
     const baseList = data.data
       .filter((m) => {
@@ -114,6 +121,10 @@ async function refreshModels() {
 // 免费 (cline-free/) 模型。这些模型走官方免费额度，不需要 credits。
 // 反之 deepseek/deepseek-v4.1-flash 是付费档，余额不足返回 402 insufficient_credits。
 // 动态刷新时同时拉这个接口，把 free 列表合并进模型池。
+// ⚠️ 只合并 data.free 分支：
+//  - data.clineCloud（如 cline-cloud/deepseek-v4.1-flash）是 Cloud Agents 浏览器沙箱专用，
+//    API 侧调用任何 UA/头组合一律 403 "only available via Cline product surfaces"（2026-10 实测），排除。
+//  - data.clinePass 需要 ClinePass 付费订阅（$9.99/月，403 ENTITLEMENT_ERROR），排除。
 // =====================================================================
 async function refreshFreeModels() {
   try {
@@ -131,10 +142,10 @@ async function refreshFreeModels() {
   }
 }
 
-// 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
-// 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
-const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "1.1.8";
+// 默认模型：Cline 官方免费通道（2026-10 名单：nemotron-3.5-super-vl / mimo-v2.6-flash /
+//   muse-spark-1.3-contributor / solar-mini4）。deepseek-v4.1-flash 已被官方下架。
+const DEFAULT_MODEL = "cline-free/nemotron-3.5-super-vl";
+const VERSION = "1.3.0";
 
 export default {
   async fetch(request, env) {
@@ -156,6 +167,7 @@ export default {
         version: VERSION,
         authenticated: !!(env.API_KEY),
         accounts: poolN,
+        strategy: parseStrategy(env),
         model: DEFAULT_MODEL,
       }, 200);
     }
@@ -175,6 +187,21 @@ export default {
       }
       if (url.pathname === "/v1/messages" || url.pathname === "/messages") {
         return handleAnthropic(request, env);
+      }
+      // Anthropic count_tokens：Claude Code 每轮会调用，粗暴估算（chars/4）
+      if (url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens") {
+        try {
+          const req = await request.json();
+          let chars = 0;
+          const sys = req.system;
+          if (sys) chars += typeof sys === "string" ? sys.length : JSON.stringify(sys).length;
+          for (const m of req.messages || []) {
+            chars += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+          }
+          return jsonResponse({ input_tokens: Math.ceil(chars / 4) }, 200);
+        } catch {
+          return jsonResponse({ input_tokens: 0 }, 200);
+        }
       }
     }
 
@@ -258,17 +285,36 @@ async function getAccountToken(account) {
   return accessToken;
 }
 
-// 轮询选择一个可用账号，返回该账号对象（并设置 currentAccount）
-function pickAccount(pool) {
-  for (let k = 0; k < pool.length; k++) {
-    const acc = pool[accountIndex % pool.length];
-    accountIndex = (accountIndex + 1) % pool.length;
-    if (!acc.cooldownUntil || acc.cooldownUntil <= Date.now()) {
-      currentAccount = acc;
-      return acc;
+// 账号调度策略（环境变量 ACCOUNT_STRATEGY，v1.1.9）：
+//  - round-robin (默认): 请求轮流使用各账号 1→2→3→1→…，均匀分摊用量。
+//    游标是 isolate 内存变量：本代理有全局串行队列，单 isolate 内严格轮转；
+//    多 isolate 并存/冷启动时为近似均匀（要求严格均匀可用 random）。
+//  - random:           每次请求随机洗牌选号，多 isolate 下分布最均匀。
+//  - fill-first:       黏住列表第一个健康账号，冷却/刷新失败才切下一个
+//                      （= v1.1.8 及以前版本的实际行为，当时宣称 round-robin 但从未生效）。
+function parseStrategy(env) {
+  const s = (env.ACCOUNT_STRATEGY || "").trim().toLowerCase();
+  if (s === "random") return "random";
+  if (s === "fill-first" || s === "fill_first" || s === "fillfirst") return "fill-first";
+  return "round-robin";
+}
+
+// 按调度策略生成本次请求尝试账号的下标顺序（冷却跳过与失败切换由 getAccessToken 处理）
+function candidateOrder(n, strategy) {
+  const idx = [...Array(n).keys()];
+  if (strategy === "fill-first") return idx;
+  if (strategy === "random") {
+    // Fisher-Yates 洗牌：随机顺序尝试
+    for (let i = n - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [idx[i], idx[j]] = [idx[j], idx[i]];
     }
+    return idx;
   }
-  return null; // 全部冷却中
+  // round-robin：从游标处旋转一周，游标前移一位
+  const start = accountIndex % n;
+  accountIndex = (accountIndex + 1) % n;
+  return idx.map((k) => (start + k) % n);
 }
 
 async function getAccessToken(env) {
@@ -276,20 +322,20 @@ async function getAccessToken(env) {
   if (pool.length === 0) {
     throw new Error("missing CLINE_REFRESH_TOKEN env var");
   }
-  // 最多尝试 pool.length 个账号（跳过冷却/刷新失败的）
-  for (let attempt = 0; attempt < pool.length; attempt++) {
-    const acc = pool[attempt % pool.length]; // 逐个尝试
+  // 按策略顺序尝试账号（跳过冷却中的；刷新失败自动切下一个）
+  const order = candidateOrder(pool.length, parseStrategy(env));
+  for (const i of order) {
+    const acc = pool[i];
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue;
     currentAccount = acc;
     try {
       return await getAccountToken(acc);
     } catch (e) {
-      if (e.message === "account_cooldown") continue;
-      continue; // 刷新失败也切下个号
+      continue; // 刷新失败也切下个号（getAccountToken 内已给该账号设置了冷却）
     }
   }
-  // 全部失败，清冷却重试一次最早的
-  const acc = pool[0];
+  // 全部冷却/失败，清掉首选账号的冷却重试一次
+  const acc = pool[order[0]];
   currentAccount = acc;
   acc.cooldownUntil = 0;
   try {
@@ -305,6 +351,7 @@ function clineHeaders(sessionId) {
   return {
     Authorization: "Bearer workos:" + currentToken,
     "Content-Type": "application/json",
+    "Accept-Encoding": "identity",
     "User-Agent": "Cline/3.0.47",
     "HTTP-Referer": "https://cline.bot",
     "X-Title": "Cline",
@@ -379,6 +426,53 @@ function parseCooldown(body, status) {
   return 60 * 1000;
 }
 
+// ---- 流式探测（issue #8 修复配套）----
+// 判定一段（首个）上游片段是否是"限流/空响应"信号（伪装成 200 SSE 的错误）
+function isLimitSignal(text) {
+  if (!text) return false;
+  return text.includes("empty response content") ||
+         text.includes("Daily free limit") ||
+         text.includes("INFERENCE_CAP_ERROR");
+}
+
+// 读上游响应的第一个 chunk（严格限量，不碰后续流），读到的字节原样返回。
+// 调用方必须把 head 重新接回流（reattachStreamHead），否则数据丢失。
+async function peekStreamHead(resp, maxWaitMs) {
+  try {
+    const reader = resp.body.getReader();
+    const timer = new Promise((resolve) => setTimeout(() => resolve({ done: true, value: undefined }), maxWaitMs));
+    const first = await Promise.race([reader.read(), timer]);
+    if (first.done) {
+      try { reader.releaseLock(); } catch {}
+      return { head: "" };
+    }
+    reader.releaseLock(); // 解锁后流仍可继续被 streamResponse 消费（首 chunk 已在缓冲区外）
+    const chunk = first.value;
+    // 半字节安全的解码（CF 环境忽略）
+    const head = new TextDecoder().decode(chunk.slice(0), { stream: true });
+    return { head, chunk };
+  } catch (e) {
+    return { head: "" };
+  }
+}
+
+// 把探测时读走的首个 chunk 拼回响应流：新建 TransformStream，先写 chunk，再 pipeRemaining
+function reattachStreamHead(resp, headChunk) {
+  if (!headChunk || !resp.body) return resp; // 无探测（如探测失败）：原样转发
+  const { readable, writable } = new TransformStream();
+  (async () => {
+    const writer = writable.getWriter();
+    try {
+      await writer.write(headChunk);
+      writer.releaseLock();        // ⚠️ pipeTo 要求 writable 未被锁；不释放会直接抛错断流
+      await resp.body.pipeTo(writable);
+    } catch (e) {
+      try { await writer.abort(); } catch {}
+    }
+  })();
+  return new Response(readable, { status: resp.status, headers: resp.headers });
+}
+
 // 带重试的 clineFetch：429限流/空响应/5xx 自动切换账号 + 指数退避重试
 // 一个号额度用完或限流(429 Daily free limit reached)时：
 //   - 冷却该账号（冷却时长按上游提示，如 2h51m）
@@ -392,19 +486,30 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
     lastResp = resp;
 
     // 统一读 body（clone 不消耗流）
+    // ⚠️ 流式响应绝不能 clone().text()——那会把整个上游流缓冲完才转发，客户端等到
+    //    生成完毕才一次性收到全部 chunk（issue #8 的根因）。流式只探测首个 chunk。
     let bodyText = "";
+    let headChunk = null; // 流式：探测出的首个上游 chunk（原样放回流）
     try {
-      bodyText = await resp.clone().text();
+      if (isStream && resp.ok && resp.body) {
+        const peek = await peekStreamHead(resp, 3000);
+        bodyText = peek.head;
+        headChunk = peek.chunk; // 字节；写回流时保持原样
+      } else {
+        bodyText = await resp.clone().text();
+      }
     } catch (e) {}
 
     // 判定"额度/限流"信号（需要切号）：
     // 1. 429（Daily free limit reached / rate limit）
     // 2. 5xx 且含 empty response content
     // 3. 200 非流式但 body 是空响应包装
+    // 4. 200 流式但首个 chunk 就带 error/empty（限流也伪装成 200 SSE）
     const isLimitHit =
       resp.status === 429 ||
       (resp.status >= 500 && bodyText.includes("empty response content")) ||
-      (resp.ok && !isStream && bodyText.includes("empty response content"));
+      (resp.ok && !isStream && bodyText.includes("empty response content")) ||
+      (resp.ok && isStream && isLimitSignal(bodyText));
 
     if (isLimitHit) {
       const cooldownMs = parseCooldown(bodyText, resp.status);
@@ -421,13 +526,15 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
         console.log(`[retry] all accounts cooling down, returning upstream response as-is`);
         return resp; // 不空转，把 429/错误返回给客户端
       }
+      // 丢弃该响应（流式流已被 peek 打开；非流式 clone 挂着）——显式 cancel 防资源泄漏
+      try { if (resp.body) await resp.body.cancel(); } catch {}
       await sleep(500 + Math.floor(Math.random() * 500));
       continue;
     }
 
     // 正常响应（200）
     if (resp.ok) {
-      if (isStream) return resp; // 流式：直接转发
+      if (isStream) return reattachStreamHead(resp, headChunk); // 流式：首个 chunk 已由探测读走，回填后转发
       return resp;               // 非流式：body 已确认非空响应
     }
 
@@ -662,8 +769,41 @@ async function handleAnthropic(request, env) {
     messages.push({ role: "system", content: sysContent });
   }
   for (const m of req.messages || []) {
-    const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-    messages.push({ role: m.role, content });
+    if (typeof m.content === "string") {
+      messages.push({ role: m.role, content: m.content });
+      continue;
+    }
+    if (Array.isArray(m.content)) {
+      // Anthropic content blocks → OpenAI 内存格式
+      //  - tool_result（user 消息里）→ role:"tool" 消息（OpenAI 规范）
+      //  - tool_use（assistant 消息里）→ assistant 消息的 tool_calls
+      //  - text → 拼接为文本内容
+      const parts = [];
+      const toolCalls = [];
+      const toolResults = [];
+      for (const blk of m.content) {
+        if (blk?.type === "text") parts.push(blk.text || "");
+        else if (blk?.type === "tool_use") {
+          toolCalls.push({ id: blk.id, type: "function", function: { name: blk.name, arguments: JSON.stringify(blk.input || {}) } });
+        } else if (blk?.type === "tool_result") {
+          const inner = typeof blk.content === "string" ? blk.content
+            : Array.isArray(blk.content) ? blk.content.filter((x) => x?.type === "text").map((x) => x.text).join("\n")
+            : JSON.stringify(blk.content ?? "");
+          toolResults.push({ role: "tool", tool_call_id: blk.tool_use_id || blk.id || "", content: inner });
+        } else if (blk?.type === "image") {
+          parts.push("[image omitted]");
+        }
+      }
+      if (toolResults.length > 0) messages.push(...toolResults);
+      if (toolCalls.length > 0) {
+        messages.push({ role: "assistant", content: parts.join("\n") || "", tool_calls: toolCalls });
+      } else if (parts.length > 0) {
+        messages.push({ role: m.role, content: parts.join("\n") });
+      }
+      continue;
+    }
+    // 其他形态（对象等）退化字符串
+    messages.push({ role: m.role, content: JSON.stringify(m.content) });
   }
 
   const body = {
@@ -693,7 +833,7 @@ async function handleAnthropic(request, env) {
     }
     if (isStream) {
       // 上游是 OpenAI SSE，转成 Anthropic SSE 格式
-      return streamResponseAnthropic(resp);
+      return streamResponseAnthropic(resp, requestedModel);
     }
     if (forceStream) {
       // 客户端要非流式 + 上游是流式：聚合后再转 Anthropic
@@ -781,8 +921,10 @@ async function streamResponse(upstream, externalModel) {
   });
 }
 
-// Anthropic SSE：把上游 OpenAI chunk 转成 Anthropic 格式
-async function streamResponseAnthropic(upstream) {
+// Anthropic SSE：把上游 OpenAI chunk 转成完整 Anthropic 事件流
+// （Claude Code / 官方 SDK 需要完整序列：message_start → content_block_start → delta... →
+//   content_block_stop → message_delta → message_stop；缺 start 事件 SDK 就收不到 tool_use）
+async function streamResponseAnthropic(upstream, externalModel) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const reader = upstream.body.getReader();
@@ -790,6 +932,14 @@ async function streamResponseAnthropic(upstream) {
   const encoder = new TextEncoder();
 
   let buf = "";
+  let modelId = externalModel || "";
+  let messageId = "msg_" + Date.now();
+  let messageStarted = false;
+  let textBlockOpen = false;   // 当前文本 content_block 是否已 start
+  const toolBlocks = new Map(); // toolIndex -> { id, name, started }
+  let nextToolIndex = 0;
+  const sse = (event, data) => encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
   (async () => {
     try {
       while (true) {
@@ -800,30 +950,86 @@ async function streamResponseAnthropic(upstream) {
         while ((idx = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, idx);
           buf = buf.slice(idx + 1);
-          if (line.startsWith("data:")) {
-            const payload = line.slice(5).trim();
-            if (payload === "" || payload === "[DONE]") continue;
-            try {
-              const obj = JSON.parse(payload);
-              const normalized = unwrapData(obj);
-              const choice = normalized?.choices?.[0];
-              if (!choice) continue;
-              const delta = choice.delta || {};
-              if (delta.content) {
-                await writer.write(encoder.encode("event: content_block_delta\ndata: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta.content } }) + "\n\n"));
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "" || payload === "[DONE]") continue;
+          try {
+            const obj = JSON.parse(payload);
+            const normalized = unwrapData(obj);
+            if (normalized?.model && !modelId) modelId = normalized.model;
+            const choice = normalized?.choices?.[0];
+            if (!choice) continue;
+            const delta = choice.delta || {};
+            const fr = choice.finish_reason;
+
+            // message_start 只发一次
+            if (!messageStarted) {
+              messageStarted = true;
+              await writer.write(sse("message_start", {
+                type: "message_start",
+                message: { id: messageId, type: "message", role: "assistant", model: modelId, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
+              }));
+            }
+
+            // 文本增量 → text content_block（首个文本 delta 前 open block）
+            if (delta.content) {
+              if (!textBlockOpen) {
+                textBlockOpen = true;
+                await writer.write(sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
               }
-              if (delta.tool_calls && delta.tool_calls.length > 0) {
-                for (const tc of delta.tool_calls) {
-                  await writer.write(encoder.encode("event: content_block_delta\ndata: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.function?.arguments || "") } }) + "\n\n"));
+              await writer.write(sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta.content } }));
+            }
+
+            // 工具调用增量 → 独立 tool_use content_block（按 index 累积 id/name/参数）
+            for (const tc of delta.tool_calls || []) {
+              const tcKey = (tc.index !== undefined && tc.index !== null) ? tc.index : 0;
+              let blk = toolBlocks.get(tcKey);
+              if (!blk) {
+                blk = { id: tc.id || ("toolu_" + Date.now() + "_" + tcKey), name: "", started: false, index: 1 + nextToolIndex };
+                nextToolIndex++;
+                toolBlocks.set(tcKey, blk);
+              }
+              if (tc.function?.name) blk.name += tc.function.name;
+              // 冷启动首个 delta 通常带 id+name，此时即打开 tool_use 块
+              if (!blk.started && (blk.id)) {
+                blk.started = true;
+                await writer.write(sse("content_block_start", { type: "content_block_start", index: blk.index, content_block: { type: "tool_use", id: blk.id, name: blk.name, input: {} } }));
+              }
+              const args = tc.function?.arguments;
+              if (args !== undefined && args !== null) {
+                await writer.write(sse("content_block_delta", { type: "content_block_delta", index: blk.index, delta: { type: "input_json_delta", partial_json: args } }));
+              }
+            }
+
+            // finish_reason 有值 → 关掉所有打开的块
+            if (fr) {
+              if (textBlockOpen) {
+                textBlockOpen = false;
+                await writer.write(sse("content_block_stop", { type: "content_block_stop", index: 0 }));
+              }
+              for (const blk of toolBlocks.values()) {
+                if (blk.started) {
+                  await writer.write(sse("content_block_stop", { type: "content_block_stop", index: blk.index }));
+                  blk.started = false;
                 }
               }
-            } catch {}
-          }
+            }
+          } catch {}
         }
       }
-      // 结束事件
-      await writer.write(encoder.encode("event: message_delta\ndata: " + JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } }) + "\n\n"));
-      await writer.write(encoder.encode("event: message_stop\ndata: " + JSON.stringify({ type: "message_stop" }) + "\n\n"));
+      // 上游没有 finish_reason 的兜底：关块
+      if (textBlockOpen) await writer.write(sse("content_block_stop", { type: "content_block_stop", index: 0 }));
+      for (const blk of toolBlocks.values()) if (blk.started) await writer.write(sse("content_block_stop", { type: "content_block_stop", index: blk.index }));
+      // 若连 message_start 都没发过（空流），补发以满足 SDK 完整性
+      if (!messageStarted) {
+        await writer.write(sse("message_start", {
+          type: "message_start",
+          message: { id: messageId, type: "message", role: "assistant", model: modelId, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
+        }));
+      }
+      const stopReason = toolBlocks.size > 0 ? "tool_use" : "end_turn";
+      await writer.write(sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 0 } }));
+      await writer.write(sse("message_stop", { type: "message_stop" }));
     } catch (e) {
     } finally {
       try { await writer.close(); } catch {}
@@ -841,17 +1047,26 @@ async function streamResponseAnthropic(upstream) {
   });
 }
 
-// OpenAI 非流式 → Anthropic 非流式
+// OpenAI 非流式 → Anthropic 非流式（含 tool_use 块）
 function openAItoAnthropic(openAI) {
   const choice = openAI?.choices?.[0];
-  const content = choice?.message?.content || "";
+  const msg = choice?.message || {};
+  const content = [];
+  const text = msg.content || "";
+  if (text) content.push({ type: "text", text });
+  for (const tc of msg.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+    content.push({ type: "tool_use", id: tc.id || ("toolu_" + Date.now()), name: tc.function?.name || "", input });
+  }
+  if (content.length === 0) content.push({ type: "text", text: "" });
   return {
-    id: openAI?.id || "msg_" + Date.now(),
+    id: openAI?.id || ("msg_" + Date.now()),
     type: "message",
     role: "assistant",
     model: openAI?.model || "",
-    content: [{ type: "text", text: content }],
-    stop_reason: "end_turn",
+    content,
+    stop_reason: (msg.tool_calls?.length || 0) > 0 ? "tool_use" : "end_turn",
     usage: {
       input_tokens: openAI?.usage?.prompt_tokens || 0,
       output_tokens: openAI?.usage?.completion_tokens || 0,

@@ -90,11 +90,12 @@ rm /tmp/cline-tokens.txt
   (paste jadi satu baris / `\n` literal). Ulangi via file di atas.
 - Habis ubah secret di dashboard CF tanpa CLI → Deploy ulang manual.
 
-Mekanisme rotasi (di `worker.js`): round-robin → accessToken di-cache per
-akun → antrean serial + jeda 800ms → 429/respons kosong/401 = cooldown akun
-itu (durasi 429 di-parse dari pesan upstream, mis. `Try again in 2h 51m`)
-+ request dicoba ulang di akun berikutnya. Semua akun cooldown → kembalikan
-respons upstream apa adanya.
+Mekanisme rotasi (di `worker.js`): `ACCOUNT_STRATEGY` (default `round-robin`;
+opsi `random` / `fill-first`) → accessToken di-cache per akun → antrean serial
++ jeda 800ms → 429/respons kosong/401 = cooldown akun itu (durasi 429 di-parse
+dari pesan upstream, mis. `Try again in 2h 51m`) + request dicoba ulang di akun
+berikutnya. Semua akun cooldown → kembalikan respons upstream apa adanya.
+`/v1/health` juga melaporkan `strategy` yang sedang dipakai.
 
 ## 5. OmniRoute
 
@@ -110,7 +111,10 @@ Node 1 (utama) — type `openai-compatible`:
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   }
   ```
-- Model: `cline-free/deepseek-v4.1-flash` (lihat `GET /v1/models` untuk daftar aktual)
+- Model: ambil dari `GET /v1/models` (Cline sering mengganti daftar model gratis).
+  Saat ini default worker: `cline-free/nemotron-3.5-super-vl`.
+  Model gratis lama (mis. `cline-free/deepseek-v4.1-flash`) sudah dihapus
+  upstream, jadi jangan hardcode — selalu cek `/v1/models` dulu.
 
 Node 2 (failover) — sama, tapi Base URL Vercel
 (`https://<project>.vercel.app/v1`), custom header opsional.
@@ -121,10 +125,12 @@ harusnya kena `1010`; request yang sama via OmniRoute harus `200`.
 Tes end-to-end:
 
 ```bash
+MODEL=$(curl -fsS https://cline2api.<subdomain>.workers.dev/v1/models \
+  | grep -o '"id":"cline-free/[^"]*"' | head -1 | sed 's/.*"cline-free\/\([^"]*\)".*/cline-free\/\1/')
 curl http://localhost:20128/v1/chat/completions \
   -H "Authorization: Bearer <key-omniroute>" \
   -H "Content-Type: application/json" \
-  -d '{"model":"cline-free/deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with OK"}]}'
+  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK\"}]}"
 ```
 
 ## 6. Catatan keamanan
@@ -136,6 +142,6 @@ curl http://localhost:20128/v1/chat/completions \
   password. Peringan: Cline memutar refreshToken tiap dipakai, salinan lama
   biasanya mati sendiri — tapi jangan diandalkan.
 - Jangan kirim `max_tokens` ke model gratis (upstream me-500-kan).
-  Worker v1.1.8 sudah membuang field itu otomatis.
+  Worker sudah membuang field itu otomatis (sejak v1.1.8, masih berlaku di v1.3.0).
 - Region Vercel di-hardcode US (`api/index.js`) — latency lebih tinggi,
   wajar untuk cadangan.

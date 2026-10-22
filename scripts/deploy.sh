@@ -3,11 +3,14 @@
 #
 # Usage:
 #   scripts/deploy.sh --tokens-file TOKENS --cf-url CF_URL --vercel-url VERCEL_URL [--api-key KEY]
-#                     [--skip-cf] [--skip-vercel] [--skip-test]
+#                     [--model MODEL] [--skip-cf] [--skip-vercel] [--skip-test]
 #
 #   TOKENS: file with one refreshToken per line (real newlines, never committed).
 #   CF_URL / VERCEL_URL: base URLs without trailing slash.
 #   API_KEY falls back to $API_KEY env var (chat test is skipped if empty).
+#   MODEL: model id used by the chat smoke test. Falls back to $MODEL env var,
+#          then to the worker's current default. Cline delists free models
+#          periodically, so keep it overridable.
 #
 # Steps: wrangler deploy + secret put (CF), vercel env rm/add + vercel --prod,
 # then GET /v1/health and POST /v1/chat/completions on both URLs.
@@ -18,6 +21,7 @@ TOKENS_FILE=""
 CF_URL="${CF_URL:-}"
 VERCEL_URL="${VERCEL_URL:-}"
 API_KEY="${API_KEY:-}"
+MODEL="${MODEL:-}"
 SKIP_CF=0
 SKIP_VERCEL=0
 SKIP_TEST=0
@@ -33,6 +37,7 @@ while [ $# -gt 0 ]; do
     --cf-url) CF_URL="${2:-}"; shift 2 ;;
     --vercel-url) VERCEL_URL="${2:-}"; shift 2 ;;
     --api-key) API_KEY="${2:-}"; shift 2 ;;
+    --model) MODEL="${2:-}"; shift 2 ;;
     --skip-cf) SKIP_CF=1; shift ;;
     --skip-vercel) SKIP_VERCEL=1; shift ;;
     --skip-test) SKIP_TEST=1; shift ;;
@@ -88,14 +93,42 @@ check_health() {
   echo "Health OK: $url"
 }
 
+# Resolve the model id for the chat smoke test.
+# Order: --model/$MODEL env > first cline-free/* id from GET /v1/models > worker's
+# own default (reported by /v1/health). Cline delists free models periodically,
+# so a hardcoded id silently breaks the smoke test.
+resolve_model() {
+  base="$1"
+  if [ -n "$MODEL" ]; then
+    echo "$MODEL"
+    return 0
+  fi
+  models="$(curl -fsS -A "$UA" "$base/v1/models" 2>/dev/null || true)"
+  picked="$(printf '%s' "$models" \
+    | grep -o '"id"[[:space:]]*:[[:space:]]*"cline-free/[^"]*"' \
+    | head -1 \
+    | sed 's/.*"cline-free\/\([^"]*\)".*/cline-free\/\1/')"
+  if [ -n "$picked" ]; then
+    echo "$picked"
+    return 0
+  fi
+  # Fall back to whatever the worker reports as its default.
+  curl -fsS -A "$UA" "$base/v1/health" 2>/dev/null \
+    | grep -o '"model"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed 's/.*"\([^"]*\)"$/\1/' || true
+}
+
 check_chat() {
   base="$1"
   [ -n "$API_KEY" ] || { echo "skip chat test (no API key): $base"; return 0; }
-  echo "==> Chat: $base/v1/chat/completions"
+  model="$(resolve_model "$base")"
+  [ -n "$model" ] || { echo "skip chat test (no model resolved): $base"; return 0; }
+  echo "==> Chat: $base/v1/chat/completions (model=$model)"
   body="$(curl -fsS -A "$UA" "$base/v1/chat/completions" \
     -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
-    -d '{"model":"cline-free/deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with OK"}],"stream":false}')"
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK\"}],\"stream\":false}")"
   echo "$body" | grep -q 'choices' || { echo "Chat FAILED: $base -> $body" >&2; return 1; }
   echo "Chat OK: $base"
 }
